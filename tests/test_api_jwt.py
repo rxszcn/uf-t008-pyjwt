@@ -5,15 +5,20 @@ from calendar import timegm
 from collections.abc import Iterator, MutableMapping
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import cast
 from unittest import mock
 
 import pytest
 
 import jwt as pyjwt
 from jwt.algorithms import get_default_algorithms
-from jwt.types import Options
 from jwt.api_jwk import PyJWK
-from jwt.api_jwt import PyJWT
+from jwt.api_jwt import (
+    _MAX_TIMESTAMP,
+    _MIN_TIMESTAMP,
+    PyJWT,
+)
+from jwt.types import Options
 from jwt.exceptions import (
     DecodeError,
     ExpiredSignatureError,
@@ -382,6 +387,207 @@ class TestJWT:
         with pytest.raises(expected) as exc:
             jwt.decode(jwt_message, secret, algorithms=["HS256"])
         assert claim in str(exc.value)
+
+
+class TestTimeClaimRange:
+    """Range enforcement shared by the ``iat``/``nbf``/``exp`` time claims.
+
+    The bounds must keep every accepted value inside the timestamp range that
+    ``datetime`` can format on all supported platforms, so an oversized claim
+    can never pass verification and crash downstream formatting code.
+    """
+
+    MIN_TS = _MIN_TIMESTAMP
+    MAX_TS = _MAX_TIMESTAMP
+
+    @staticmethod
+    def _disable_check(claim: str) -> Options:
+        """Build typed options that switch off a single verify_<claim> gate."""
+        return cast(Options, {f"verify_{claim}": False})
+
+    @pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
+    @pytest.mark.parametrize("value", [10**30, -(10**30), MAX_TS + 1, MIN_TS - 1])
+    def test_decode_rejects_out_of_range_time_claims(
+        self, jwt: PyJWT, claim: str, value: int
+    ) -> None:
+        # Such tokens may already exist in the wild, so they are hand-crafted at
+        # the JWS layer instead of going through jwt.encode (which now refuses
+        # to mint them).
+        jwt_message = jwt._jws.encode(
+            json.dumps({claim: value}, separators=(",", ":")).encode(),
+            "secret",
+            "HS256",
+            None,
+            None,
+        )
+
+        expected = InvalidIssuedAtError if claim == "iat" else DecodeError
+        with pytest.raises(expected) as exc:
+            jwt.decode(jwt_message, "secret", algorithms=["HS256"])
+        # The message names the offending claim and the enforced bounds.
+        assert claim in str(exc.value)
+        assert str(self.MIN_TS) in str(exc.value)
+        assert str(self.MAX_TS) in str(exc.value)
+
+    @pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
+    @pytest.mark.parametrize("value", [MIN_TS, MAX_TS])
+    def test_decode_accepts_inclusive_boundary_values(
+        self, jwt: PyJWT, claim: str, value: int
+    ) -> None:
+        jwt_message = jwt.encode({claim: value}, "secret", algorithm="HS256")
+        decoded = jwt.decode(
+            jwt_message,
+            "secret",
+            algorithms=["HS256"],
+            # Boundary values are far enough from "now" that freshness checks
+            # would dominate; disable the individual check so only the range
+            # enforcement is exercised here.
+            options=self._disable_check(claim),
+        )
+        assert decoded[claim] == value
+
+    def test_boundary_values_are_safely_formattable(self) -> None:
+        # Regression guard for the original incident: every value the range
+        # check lets through must round-trip through the datetime formatters
+        # downstream consumers use, on every supported platform.
+        for value in (self.MIN_TS, self.MAX_TS):
+            datetime.fromtimestamp(value, tz=timezone.utc)
+
+    @pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
+    def test_leeway_does_not_relax_the_range_bounds(
+        self, jwt: PyJWT, claim: str
+    ) -> None:
+        # A large leeway must not let an oversized value slip through: range
+        # validation happens before (and independently of) the leeway window.
+        jwt_message = jwt._jws.encode(
+            json.dumps({claim: 10**30}, separators=(",", ":")).encode(),
+            "secret",
+            "HS256",
+            None,
+            None,
+        )
+        expected = InvalidIssuedAtError if claim == "iat" else DecodeError
+        with pytest.raises(expected):
+            jwt.decode(
+                jwt_message,
+                "secret",
+                algorithms=["HS256"],
+                leeway=timedelta(days=365 * 1000),
+            )
+
+    def test_leeway_still_relaxes_normal_expiration(self, jwt: PyJWT) -> None:
+        # The window keeps its original meaning for in-range timestamps: a token
+        # expired within the leeway is still accepted.
+        secret = "secret"
+        jwt_message = jwt.encode(
+            {"exp": utc_timestamp() - 2}, secret, algorithm="HS256"
+        )
+        decoded = jwt.decode(jwt_message, secret, algorithms=["HS256"], leeway=5)
+        assert decoded["exp"] < utc_timestamp()
+
+    def test_oversized_exp_is_rejected_before_downstream_formatting(
+        self, jwt: PyJWT
+    ) -> None:
+        # End-to-end reproduction of the production crash: an oversized exp used
+        # to verify successfully and then blow up datetime.fromtimestamp
+        # downstream. Verification must now reject it instead.
+        oversized = 10**30
+        jwt_message = jwt._jws.encode(
+            json.dumps({"exp": oversized}, separators=(",", ":")).encode(),
+            "secret",
+            "HS256",
+            None,
+            None,
+        )
+
+        with pytest.raises(DecodeError):
+            jwt.decode(jwt_message, "secret", algorithms=["HS256"])
+
+        # The raw value is genuinely unformattable, proving why the upstream
+        # rejection is necessary rather than cosmetic.
+        with pytest.raises((OverflowError, OSError, ValueError)):
+            datetime.fromtimestamp(oversized, tz=timezone.utc)
+
+    @pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
+    def test_encode_refuses_oversized_finite_time_claims(
+        self, jwt: PyJWT, claim: str
+    ) -> None:
+        # The library must not mint new tokens carrying unformattable values.
+        expected = InvalidIssuedAtError if claim == "iat" else DecodeError
+        with pytest.raises(expected):
+            jwt.encode({claim: 10**30}, "secret", algorithm="HS256")
+
+    @pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
+    @pytest.mark.parametrize("value", [float("inf"), float("nan")])
+    def test_encode_allows_non_finite_floats_but_decode_rejects_them(
+        self, jwt: PyJWT, claim: str, value: float
+    ) -> None:
+        # Non-finite floats cannot be compared against integer bounds at encode
+        # time; preserve JSON round-tripping and let verification raise the
+        # clean type error (no leaked ValueError/OverflowError from int()).
+        jwt_message = jwt.encode({claim: value}, "secret", algorithm="HS256")
+        expected = InvalidIssuedAtError if claim == "iat" else DecodeError
+        with pytest.raises(expected):
+            jwt.decode(jwt_message, "secret", algorithms=["HS256"])
+
+    @pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
+    def test_numeric_string_boundary_is_range_checked(
+        self, jwt: PyJWT, claim: str
+    ) -> None:
+        # Numeric strings keep their historical permissive coercion, but the
+        # resulting integer still goes through the same range gate.
+        jwt_message = jwt._jws.encode(
+            json.dumps({claim: str(10**30)}, separators=(",", ":")).encode(),
+            "secret",
+            "HS256",
+            None,
+            None,
+        )
+        expected = InvalidIssuedAtError if claim == "iat" else DecodeError
+        with pytest.raises(expected):
+            jwt.decode(jwt_message, "secret", algorithms=["HS256"])
+
+        in_range = jwt.encode({claim: "1638202770"}, "secret", algorithm="HS256")
+        decoded = jwt.decode(
+            in_range,
+            "secret",
+            algorithms=["HS256"],
+            options=self._disable_check(claim),
+        )
+        assert decoded[claim] == "1638202770"
+
+    @pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
+    def test_range_check_skipped_when_verification_disabled(
+        self, jwt: PyJWT, claim: str
+    ) -> None:
+        # Turning the individual claim check off also skips its range gate, so
+        # callers can still decode legacy oversized tokens when they explicitly
+        # accept the downstream-formatting risk.
+        jwt_message = jwt._jws.encode(
+            json.dumps({claim: 10**30}, separators=(",", ":")).encode(),
+            "secret",
+            "HS256",
+            None,
+            None,
+        )
+        decoded = jwt.decode(
+            jwt_message,
+            "secret",
+            algorithms=["HS256"],
+            options=self._disable_check(claim),
+        )
+        assert decoded[claim] == 10**30
+
+    def test_known_far_future_exp_still_accepted(self, jwt: PyJWT) -> None:
+        # Compatibility: existing far-future but still representable tokens
+        # (e.g. AWS-style exp around year 2286) must keep working unchanged.
+        token = jwt.encode(
+            {"email": "a@b.com", "exp": 9999999999, "sub": "user"},
+            "secret",
+            algorithm="HS256",
+        )
+        decoded = jwt.decode(token, "secret", algorithms=["HS256"])
+        assert decoded["exp"] == 9999999999
 
     def test_decode_allows_aud_to_be_none(self, jwt: PyJWT) -> None:
         # >>> jwt.encode({'aud': None}, 'secret')

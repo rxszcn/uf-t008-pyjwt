@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import warnings
 from calendar import timegm
@@ -37,6 +38,49 @@ if TYPE_CHECKING or bool(os.getenv("SPHINX_BUILD", "")):
 
     AllowedPrivateKeyTypes: TypeAlias = Union[AllowedPrivateKeys, PyJWK, str, bytes]
     AllowedPublicKeyTypes: TypeAlias = Union[AllowedPublicKeys, PyJWK, str, bytes]
+
+#: Numeric date claims (``iat``/``nbf``/``exp``) are NumericDate values per
+#: RFC 7519 and must stay within the range that downstream consumers can turn
+#: back into a :class:`~datetime.datetime` without crashing on *any* supported
+#: platform.
+#:
+#: The lower bound is the Unix epoch (``0``). Negative timestamps cannot be
+#: formatted through the C ``localtime`` layer on every platform (Windows
+#: raises ``OSError`` for them), and a pre-1970 JWT time claim is never a
+#: legitimate value in practice.
+#:
+#: The upper bound is chosen below the strictest supported C runtime limit.
+#: Windows' ``localtime``/``gmtime`` implementation rejects timestamps past
+#: ``3001-01-19`` (``OSError``), while a value beyond :data:`datetime.max`
+#: raises ``OverflowError`` elsewhere. Rather than hard-coding that platform
+#: magic number, the bound is the last second of year 3000 -- a clean,
+#: portable value that stays safely below every supported limit, so every
+#: accepted value is formattable on every platform. It is still far beyond any
+#: realistic token lifetime, and existing far-future tokens such as
+#: ``exp = 9999999999`` (year 2286) remain valid.
+#:
+#: Rejecting out-of-range claims at verification time means an oversized value
+#: can never pass verification and reach downstream formatting code, even when
+#: a verification ``leeway`` is configured. The bounds are intentionally shared
+#: by ``iat``, ``nbf`` and ``exp`` so the three claims are validated
+#: consistently.
+_MIN_TIMESTAMP = 0
+_MAX_TIMESTAMP = timegm(datetime(3001, 1, 1, tzinfo=timezone.utc).utctimetuple()) - 1
+
+#: Exception raised for an out-of-range or non-numeric time claim, keyed by
+#: claim name. The mapping preserves the historical exception types (``iat``
+#: failures surface as ``InvalidIssuedAtError``; the other two as
+#: ``DecodeError``) so existing ``except`` clauses keep working.
+_TIME_CLAIM_ERRORS = {
+    "iat": InvalidIssuedAtError,
+    "nbf": DecodeError,
+    "exp": DecodeError,
+}
+_TIME_CLAIM_NAMES = {
+    "iat": "Issued At claim (iat)",
+    "nbf": "Not Before claim (nbf)",
+    "exp": "Expiration Time claim (exp)",
+}
 
 
 class PyJWT:
@@ -135,6 +179,21 @@ class PyJWT:
             # Convert datetime to a intDate value in known time-format claims
             if isinstance(payload.get(time_claim), datetime):
                 payload[time_claim] = timegm(payload[time_claim].utctimetuple())
+
+            # Reject oversized finite numeric time claims at issuance time as
+            # well, so this library cannot mint tokens whose time claims would
+            # crash downstream datetime formatting. The same bounds are enforced
+            # when verifying. Non-finite floats (inf/nan) and non-numeric values
+            # are left untouched here: they cannot be compared against integer
+            # bounds and are instead rejected with a clean type error during
+            # verification.
+            time_value = payload.get(time_claim)
+            if (
+                isinstance(time_value, (int, float))
+                and not isinstance(time_value, bool)
+                and math.isfinite(time_value)
+            ):
+                self._check_timestamp_range(int(time_value), time_claim)
 
         # Issue #1039, iss being set to non-string
         if "iss" in payload and not isinstance(payload["iss"], str):
@@ -467,18 +526,63 @@ class PyJWT:
         if not isinstance(payload.get("jti"), str):
             raise InvalidJTIError("JWT ID must be a string")
 
+    @staticmethod
+    def _check_timestamp_range(value: int, claim: str) -> None:
+        """Reject time claims outside the representable timestamp range.
+
+        The range check is independent of ``leeway``: a verification window only
+        shifts the freshness comparison and must never let an oversized,
+        unformattable value through.
+        """
+        if not _MIN_TIMESTAMP <= value <= _MAX_TIMESTAMP:
+            raise _TIME_CLAIM_ERRORS[claim](
+                f"{_TIME_CLAIM_NAMES[claim]} must be a valid timestamp "
+                f"between {_MIN_TIMESTAMP} and {_MAX_TIMESTAMP}."
+            )
+
+    def _validate_timestamp(self, payload: dict[str, Any], claim: str) -> int:
+        """Shared validation chain for the ``iat``/``nbf``/``exp`` time claims.
+
+        Step 1 -- coercion: the claim must convert cleanly to an integer. This
+        keeps the historical permissive behavior for numeric strings (e.g.
+        ``"1638202770"``) and floats while raising a clean PyJWT error instead
+        of leaking ``int()``'s runtime errors for ``None``, containers or the
+        non-finite floats ``inf``/``nan``.
+
+        Step 2 -- range: the resulting integer must lie within
+        ``[_MIN_TIMESTAMP, _MAX_TIMESTAMP]`` so it can always be formatted as a
+        datetime downstream. This runs before any leeway comparison, so an
+        out-of-range claim is rejected regardless of the configured window.
+        """
+        raw_value = payload[claim]
+        # Non-finite floats (inf/nan) are not valid NumericDate values and
+        # ``int()`` only rejects them with an OverflowError/ValueError; reject
+        # them here as type errors, before they could be coerced into an
+        # arbitrary integer and misclassified as a mere range violation.
+        if isinstance(raw_value, float) and not math.isfinite(raw_value):
+            raise _TIME_CLAIM_ERRORS[claim](
+                f"{_TIME_CLAIM_NAMES[claim]} must be an integer."
+            ) from None
+
+        try:
+            timestamp = int(raw_value)
+        except (ValueError, TypeError, OverflowError):
+            raise _TIME_CLAIM_ERRORS[claim](
+                f"{_TIME_CLAIM_NAMES[claim]} must be an integer."
+            ) from None
+
+        self._check_timestamp_range(timestamp, claim)
+        return timestamp
+
     def _validate_iat(
         self,
         payload: dict[str, Any],
         now: float,
         leeway: float,
     ) -> None:
-        try:
-            iat = int(payload["iat"])
-        except (ValueError, TypeError, OverflowError):
-            raise InvalidIssuedAtError(
-                "Issued At claim (iat) must be an integer."
-            ) from None
+        iat = self._validate_timestamp(payload, "iat")
+        # Leeway only relaxes the future-dated (immature) comparison; it cannot
+        # rescue an out-of-range value rejected above.
         if iat > (now + leeway):
             raise ImmatureSignatureError("The token is not yet valid (iat)")
 
@@ -488,11 +592,8 @@ class PyJWT:
         now: float,
         leeway: float,
     ) -> None:
-        try:
-            nbf = int(payload["nbf"])
-        except (ValueError, TypeError, OverflowError):
-            raise DecodeError("Not Before claim (nbf) must be an integer.") from None
-
+        nbf = self._validate_timestamp(payload, "nbf")
+        # Leeway only relaxes the future-dated (not-before) comparison.
         if nbf > (now + leeway):
             raise ImmatureSignatureError("The token is not yet valid (nbf)")
 
@@ -502,13 +603,9 @@ class PyJWT:
         now: float,
         leeway: float,
     ) -> None:
-        try:
-            exp = int(payload["exp"])
-        except (ValueError, TypeError, OverflowError):
-            raise DecodeError(
-                "Expiration Time claim (exp) must be an integer."
-            ) from None
-
+        exp = self._validate_timestamp(payload, "exp")
+        # Leeway only relaxes the expired comparison (a token expired within
+        # the window is still accepted); it cannot rescue an out-of-range value.
         if exp <= (now - leeway):
             raise ExpiredSignatureError("Signature has expired")
 
